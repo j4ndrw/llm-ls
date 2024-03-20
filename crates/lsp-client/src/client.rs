@@ -58,7 +58,7 @@ impl LspClient {
     pub async fn send_request<R: lsp_types::request::Request>(
         &self,
         params: R::Params,
-    ) -> Result<R::Result> {
+    ) -> Result<Response> {
         let (sender, receiver) = oneshot::channel::<Response>();
         let request =
             self.res_queue
@@ -68,8 +68,7 @@ impl LspClient {
                 .register(R::METHOD.to_string(), params, sender);
 
         self.send(request.into());
-        let (_, result) = receiver.await?.extract::<R::Result>()?;
-        Ok(result)
+        Ok(receiver.await?)
     }
 
     async fn complete_request(

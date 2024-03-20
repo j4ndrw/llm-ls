@@ -1,6 +1,7 @@
 use std::{
     fmt::{self, Display},
     io,
+    marker::Unpin,
 };
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};

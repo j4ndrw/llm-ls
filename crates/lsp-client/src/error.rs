@@ -65,9 +65,7 @@ impl fmt::Display for ExtractError {
 pub enum Error {
     ChannelClosed(RecvError),
     Io(io::Error),
-    Extract(ExtractError),
     MissingBinaryPath,
-    Parse(String),
 }
 
 impl std::error::Error for Error {}
@@ -78,8 +76,6 @@ impl fmt::Display for Error {
             Error::ChannelClosed(e) => write!(f, "Channel closed: {}", e),
             Error::Io(e) => write!(f, "IO error: {}", e),
             Error::MissingBinaryPath => write!(f, "Missing binary path"),
-            Error::Parse(e) => write!(f, "parse error: {}", e),
-            Error::Extract(e) => write!(f, "extract error: {}", e),
         }
     }
 }
@@ -93,12 +89,6 @@ impl From<RecvError> for Error {
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
-    }
-}
-
-impl From<ExtractError> for Error {
-    fn from(value: ExtractError) -> Self {
-        Self::Extract(value)
     }
 }
 
