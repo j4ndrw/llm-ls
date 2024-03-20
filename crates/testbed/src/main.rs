@@ -10,9 +10,13 @@ use std::{
 
 use anyhow::anyhow;
 use clap::Parser;
+use custom_types::{
+    llm_ls::{Backend, FimParams, GetCompletionsParams, Ide, TokenizerConfig},
+    request::GetCompletions,
+};
 use futures_util::{stream::FuturesUnordered, StreamExt, TryStreamExt};
 use lang::Language;
-use lsp_client::{client::LspClient, error::ExtractError, msg::RequestId, server::Server};
+use lsp_client::{client::LspClient, error::ExtractError, server::Server};
 use lsp_types::{
     DidOpenTextDocumentParams, InitializeParams, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams,
@@ -20,10 +24,15 @@ use lsp_types::{
 use ropey::Rope;
 use runner::Runner;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use tempfile::TempDir;
 use tokio::{
     fs::{self, read_to_string, File, OpenOptions},
-    io::{self, AsyncReadExt, AsyncWriteExt},
+    io::{
+        self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt,
+        BufReader as TokioBufReader,
+    },
+    join,
     process::Command,
     sync::{OnceCell, RwLock, Semaphore},
 };
@@ -32,19 +41,11 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
-use crate::{
-    holes_generator::generate_holes,
-    runner::run_test,
-    types::{
-        FimParams, GetCompletions, GetCompletionsParams, GetCompletionsResult, Ide, RequestParams,
-        TokenizerConfig,
-    },
-};
+use crate::{holes_generator::generate_holes, runner::run_test};
 
 mod holes_generator;
 mod lang;
 mod runner;
-mod types;
 
 /// Testbed runs llm-ls' code completion to measure its performance
 #[derive(Parser, Debug)]
@@ -201,11 +202,13 @@ struct RepositoriesConfig {
     context_window: usize,
     fim: FimParams,
     model: String,
-    request_params: RequestParams,
+    #[serde(flatten)]
+    backend: Backend,
     repositories: Vec<Repository>,
     tls_skip_verify_insecure: bool,
     tokenizer_config: Option<TokenizerConfig>,
     tokens_to_clear: Vec<String>,
+    request_body: Map<String, Value>,
 }
 
 struct HoleCompletionResult {
@@ -402,15 +405,20 @@ async fn run_setup(
             command.0,
             command.1.join(" ")
         );
-        let status = status_cmd
+        let mut child = status_cmd
             .args(&command.1)
             .current_dir(&repo_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?
-            .wait()
-            .await?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
 
+        if let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) {
+            let stdout = TokioBufReader::new(stdout);
+            let stderr = TokioBufReader::new(stderr);
+            join!(log_lines(stdout), log_lines(stderr));
+        }
+
+        let status = child.wait().await?;
         if !status.success() {
             return Err(anyhow!(
                 "error running: \"{} {}\"",
@@ -434,15 +442,29 @@ async fn build(
         status_cmd.env(name, value);
     }
     debug!("building repo: {command} {args:?}");
-    let status = status_cmd
+
+    let mut child = status_cmd
         .args(args)
         .current_dir(repo_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?
-        .wait()
-        .await?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) {
+        let stdout = TokioBufReader::new(stdout);
+        let stderr = TokioBufReader::new(stderr);
+        join!(log_lines(stdout), log_lines(stderr));
+    }
+
+    let status = child.wait().await?;
     Ok(status.success())
+}
+
+async fn log_lines<R: AsyncReadExt + AsyncBufRead + Unpin>(stdio: R) {
+    let mut lines = stdio.lines();
+    while let Ok(Some(log)) = lines.next_line().await {
+        debug!("{log}");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -463,10 +485,11 @@ async fn complete_holes(
         context_window,
         fim,
         model,
-        request_params,
+        backend,
         tls_skip_verify_insecure,
         tokenizer_config,
         tokens_to_clear,
+        request_body,
         ..
     } = repos_config;
     async move {
@@ -516,14 +539,14 @@ async fn complete_holes(
                 },
             },
         );
-        let response = client
+        let result = client
             .send_request::<GetCompletions>(GetCompletionsParams {
                 api_token: api_token.clone(),
                 context_window,
                 fim: fim.clone(),
                 ide: Ide::default(),
                 model: model.clone(),
-                request_params: request_params.clone(),
+                backend,
                 text_document_position: TextDocumentPositionParams {
                     position: hole.cursor,
                     text_document: TextDocumentIdentifier { uri },
@@ -531,9 +554,9 @@ async fn complete_holes(
                 tls_skip_verify_insecure,
                 tokens_to_clear: tokens_to_clear.clone(),
                 tokenizer_config: tokenizer_config.clone(),
+                request_body: request_body.clone(),
             })
             .await?;
-        let (_, result): (RequestId, GetCompletionsResult) = response.extract()?;
 
         file_content.insert(hole_start, &result.completions[0].generated_text);
         let mut file = OpenOptions::new()
